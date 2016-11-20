@@ -316,7 +316,7 @@ This method should return a ``bundle``, whether it modifies the existing one or 
 The Hydrate Cycle
 -------------------
 
-Tastypie uses a "hydrate" cycle to take serializated data from the client
+Tastypie uses a "hydrate" cycle to take serialized data from the client
 and turn it into something the data model can use. This is the reverse process
 from the ``dehydrate`` cycle. In fact, by default, Tastypie's serialized data
 should be "round-trip-able", meaning the data that comes out should be able to
@@ -592,6 +592,9 @@ The inner ``Meta`` class allows for class-level configuration of how the
   Keys should be the fieldnames as strings while values should be a list of
   accepted filter types.
 
+  This also restricts what fields can be filtered on when manually
+  calling ``obj_get`` and ``obj_get_list``.
+
 ``ordering``
 ------------
 
@@ -629,7 +632,11 @@ The inner ``Meta`` class allows for class-level configuration of how the
 ----------
 
   Controls what introspected fields the ``Resource`` should include.
-  A whitelist of fields. Default is ``[]``.
+  A whitelist of fields. Default is ``None``.
+
+  The default value of ``None`` means that all Django fields will be 
+  introspected. In order to specify that no fields should be introspected,
+  use ``[]``
 
 ``excludes``
 ------------
@@ -767,6 +774,14 @@ as handling exceptions better.
 Note that if ``BadRequest`` or an exception with a ``response`` attr are seen,
 there is special handling to either present a message back to the user or
 return the response traveling with the exception.
+
+``get_response_class_for_exception``
+------------------------------------
+
+.. method:: Resource.get_response_class_for_exception(self, request, exception)
+
+Can be overridden to customize response classes used for uncaught exceptions.
+Should always return a subclass of``django.http.HttpResponse``.
 
 ``base_urls``
 -------------

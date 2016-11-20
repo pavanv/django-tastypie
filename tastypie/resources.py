@@ -1,6 +1,6 @@
 from __future__ import unicode_literals
 
-from copy import deepcopy
+from copy import copy, deepcopy
 from datetime import datetime
 import logging
 import sys
@@ -46,6 +46,7 @@ from tastypie.constants import ALL, ALL_WITH_RELATIONS
 from tastypie.exceptions import (
     NotFound, BadRequest, InvalidFilterError, HydrationError, InvalidSortError,
     ImmediateHttpResponse, Unauthorized, UnsupportedFormat,
+    UnsupportedSerializationFormat, UnsupportedDeserializationFormat,
 )
 from tastypie import fields
 from tastypie import http
@@ -94,7 +95,7 @@ class ResourceOptions(object):
     ordering = []
     object_class = None
     queryset = None
-    fields = []
+    fields = None
     excludes = []
     include_resource_uri = True
     include_absolute_url = False
@@ -192,12 +193,14 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
         # TypeError: object.__new__(method-wrapper) is not safe, use method-wrapper.__new__()
         # when trying to copy a generator used as a default. Wrap call to
         # generator in lambda to get around this error.
-        self.fields = deepcopy(self.base_fields)
+        self.fields = {k: copy(v) for k, v in self.base_fields.items()}
 
         if api_name is not None:
             self._meta.api_name = api_name
 
     def __getattr__(self, name):
+        if name == '__setstate__':
+            raise AttributeError(name)
         try:
             return self.fields[name]
         except KeyError:
@@ -269,43 +272,52 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
 
         return wrapper
 
-    def _handle_500(self, request, exception):
-        the_trace = '\n'.join(traceback.format_exception(*(sys.exc_info())))
-        response_class = http.HttpApplicationError
-        response_code = 500
-
-        NOT_FOUND_EXCEPTIONS = (NotFound, ObjectDoesNotExist, Http404)
-
-        if isinstance(exception, NOT_FOUND_EXCEPTIONS):
-            response_class = HttpResponseNotFound
-            response_code = 404
-
+    def get_response_class_for_exception(self, request, exception):
+        """
+        Can be overridden to customize response classes used for uncaught
+        exceptions. Should always return a subclass of
+        ``django.http.HttpResponse``.
+        """
+        if isinstance(exception, (NotFound, ObjectDoesNotExist, Http404)):
+            return HttpResponseNotFound
+        elif isinstance(exception, UnsupportedSerializationFormat):
+            return http.HttpNotAcceptable
+        elif isinstance(exception, UnsupportedDeserializationFormat):
+            return http.HttpUnsupportedMediaType
         elif isinstance(exception, UnsupportedFormat):
-            response_class = http.HttpBadRequest
-            response_code = 400
+            return http.HttpBadRequest
+
+        return http.HttpApplicationError
+
+    def _handle_500(self, request, exception):
+        the_trace = traceback.format_exception(*sys.exc_info())
+        if six.PY2:
+            the_trace = [
+                six.text_type(line, 'utf-8')
+                for line in the_trace
+            ]
+        the_trace = u'\n'.join(the_trace)
+
+        response_class = self.get_response_class_for_exception(request, exception)
 
         if settings.DEBUG:
             data = {
                 "error_message": sanitize(six.text_type(exception)),
                 "traceback": the_trace,
             }
-            return self.error_response(request, data, response_class=response_class)
+        else:
+            data = {
+                "error_message": getattr(settings, 'TASTYPIE_CANNED_ERROR', "Sorry, this request could not be processed. Please try again later."),
+            }
 
-        # When DEBUG is False, send an error message to the admins (unless it's
-        # a 404, in which case we check the setting).
-
-        if not response_code == 404:
+        if response_class.status_code >= 500:
             log = logging.getLogger('django.request.tastypie')
             log.error('Internal Server Error: %s' % request.path, exc_info=True,
-                      extra={'status_code': response_code, 'request': request})
+                      extra={'status_code': response_class.status_code, 'request': request})
 
         # Send the signal so other apps are aware of the exception.
         got_request_exception.send(self.__class__, request=request)
 
-        # Prep the data going out.
-        data = {
-            "error_message": getattr(settings, 'TASTYPIE_CANNED_ERROR', "Sorry, this request could not be processed. Please try again later."),
-        }
         return self.error_response(request, data, response_class=response_class)
 
     def _build_reverse_url(self, name, args=None, kwargs=None):
@@ -836,12 +848,18 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
         if prefix and chomped_uri.startswith(prefix):
             chomped_uri = chomped_uri[len(prefix) - 1:]
 
-        # We mangle the path a bit further & run URL resolution against *only*
-        # the current class. This ought to prevent bad URLs from resolving to
-        # incorrect data.
-        found_at = chomped_uri.rfind(self._meta.resource_name)
-        if found_at == -1:
+        # We know that we are dealing with a "detail" URI
+        # Look for the beginning of object key (last meaningful part of the URI)
+        end_of_resource_name = chomped_uri.rstrip('/').rfind('/')
+        if end_of_resource_name == -1:
             raise NotFound("An incorrect URL was provided '%s' for the '%s' resource." % (uri, self.__class__.__name__))
+        # We mangle the path a bit further & run URL resolution against *only*
+        # the current class (but up to detail key). This ought to prevent bad
+        # URLs from resolving to incorrect data.
+        split_url = chomped_uri.rstrip('/').rsplit('/', 1)[0]
+        if not split_url.endswith('/' + self._meta.resource_name):
+            raise NotFound("An incorrect URL was provided '%s' for the '%s' resource." % (uri, self.__class__.__name__))
+        found_at = chomped_uri.rfind(self._meta.resource_name, 0, end_of_resource_name)
         chomped_uri = chomped_uri[found_at:]
         try:
             for url_resolver in getattr(self, 'urls', []):
@@ -1047,7 +1065,7 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
                     related_type = 'to_one'
                 data['fields'][field_name]['related_type'] = related_type
                 try:
-                    uri = reverse('api_get_schema', kwargs={
+                    uri = self._build_reverse_url('api_get_schema', kwargs={
                         'api_name': self._meta.api_name,
                         'resource_name': field_object.to_class()._meta.resource_name
                     })
@@ -1769,18 +1787,26 @@ class ModelDeclarativeMetaclass(DeclarativeMetaclass):
             setattr(meta, 'object_class', meta.queryset.model)
 
         new_class = super(ModelDeclarativeMetaclass, cls).__new__(cls, name, bases, attrs)
-        include_fields = getattr(new_class._meta, 'fields', [])
+        specified_fields = getattr(new_class._meta, 'fields', None)
         excludes = getattr(new_class._meta, 'excludes', [])
         field_names = list(new_class.base_fields.keys())
+
+        include_fields = specified_fields
+
+        if include_fields is None:
+            if meta and meta.object_class:
+                include_fields = [f.name for f in meta.object_class._meta.fields]
+            else:
+                include_fields = []
 
         for field_name in field_names:
             if field_name == 'resource_uri':
                 continue
             if field_name in new_class.declared_fields:
                 continue
-            if len(include_fields) and field_name not in include_fields:
+            if specified_fields is not None and field_name not in include_fields:
                 del(new_class.base_fields[field_name])
-            if len(excludes) and field_name in excludes:
+            if field_name in excludes:
                 del(new_class.base_fields[field_name])
 
         # Add in the new fields.
@@ -1871,11 +1897,11 @@ class BaseModelResource(Resource):
                 continue
 
             # If field is not present in explicit field listing, skip
-            if fields and f.name not in fields:
+            if f.name not in fields:
                 continue
 
             # If field is in exclude list, skip
-            if excludes and f.name in excludes:
+            if f.name in excludes:
                 continue
 
             if cls.should_skip_field(f):
@@ -2154,7 +2180,7 @@ class BaseModelResource(Resource):
             if len(object_list) <= 0:
                 raise self._meta.object_class.DoesNotExist("Couldn't find an instance of '%s' which matched '%s'." % (self._meta.object_class.__name__, stringified_kwargs))
             elif len(object_list) > 1:
-                raise MultipleObjectsReturned("More than '%s' matched '%s'." % (self._meta.object_class.__name__, stringified_kwargs))
+                raise MultipleObjectsReturned("More than one '%s' matched '%s'." % (self._meta.object_class.__name__, stringified_kwargs))
 
             bundle.obj = object_list[0]
             self.authorized_read_detail(object_list, bundle)

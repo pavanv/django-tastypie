@@ -568,9 +568,13 @@ class DateTimeFieldTestCase(TestCase):
         field_2 = DateTimeField(default=aware_datetime(2010, 4, 1, 1, 7))
         self.assertEqual(field_2.dehydrate(bundle), aware_datetime(2010, 4, 1, 1, 7))
 
-        note.created_string = '2010-04-02 01:11:00'
         field_3 = DateTimeField(attribute='created_string')
-        self.assertEqual(field_3.dehydrate(bundle), aware_datetime(2010, 4, 2, 1, 11))
+
+        note.created_string = '2010-04-02T01:11:01'
+        self.assertEqual(field_3.dehydrate(bundle), aware_datetime(2010, 4, 2, 1, 11, 1))
+
+        note.created_string = '2010-04-02 01:11:02'
+        self.assertEqual(field_3.dehydrate(bundle), aware_datetime(2010, 4, 2, 1, 11, 2))
 
     def test_hydrate(self):
         bundle_1 = Bundle(data={
@@ -778,6 +782,12 @@ class ToOneFieldTestCase(TestCase):
         self.assertEqual(field_2.hydrate(bundle), None)
 
         # Wrong resource URI.
+        field_3 = ToOneField(UserResource, 'author')
+        field_3.instance_name = 'fk'
+        bundle.data['fk'] = '/api/v1/users/123/'
+        self.assertRaises(ApiFieldError, field_3.hydrate, bundle)
+
+        # Wrong resource URI pk type.
         field_3 = ToOneField(UserResource, 'author')
         field_3.instance_name = 'fk'
         bundle.data['fk'] = '/api/v1/users/abc/'
@@ -1271,6 +1281,12 @@ class ToManyFieldTestCase(TestCase):
         self.assertEqual(field_3.hydrate_m2m(bundle_3), [])
 
         # Wrong resource URI.
+        field_4 = ToManyField(SubjectResource, 'subjects')
+        field_4.instance_name = 'm2m'
+        bundle_4 = Bundle(data={'m2m': ['/api/v1/subjects/123/']})
+        self.assertRaises(ApiFieldError, field_4.hydrate_m2m, bundle_4)
+
+        # Wrong resource URI pk type.
         field_4 = ToManyField(SubjectResource, 'subjects')
         field_4.instance_name = 'm2m'
         bundle_4 = Bundle(data={'m2m': ['/api/v1/subjects/abc/']})

@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+from __future__ import unicode_literals
+
 import base64
 from collections import OrderedDict
 import copy
@@ -5,13 +8,15 @@ import datetime
 from decimal import Decimal
 import json
 from mock import patch, Mock
+import sys
 import time
 from unittest import skipIf
 
+import django
 from django import forms
 from django.contrib.auth.models import User
 from django.core.cache import cache
-from django.core.exceptions import FieldError, MultipleObjectsReturned
+from django.core.exceptions import FieldError, MultipleObjectsReturned, ObjectDoesNotExist
 from django.core import mail
 from django.core.urlresolvers import reverse
 from django.http import HttpRequest, QueryDict, Http404
@@ -26,6 +31,7 @@ from tastypie.bundle import Bundle
 from tastypie.exceptions import (
     InvalidFilterError, InvalidSortError, ImmediateHttpResponse, BadRequest,
     NotFound, UnsupportedFormat,
+    UnsupportedSerializationFormat, UnsupportedDeserializationFormat,
 )
 from tastypie import fields, http
 from tastypie.paginator import Paginator
@@ -37,6 +43,7 @@ from tastypie.serializers import Serializer
 from tastypie.throttle import CacheThrottle
 from tastypie.utils import aware_datetime, make_naive
 from tastypie.validation import FormValidation
+
 from core.models import (
     Note, NoteWithEditor, Subject, MediaBit, AutoNowNote, DateRecord, Counter,
     MyDefaultPKModel, MyUUIDModel, MyRelatedUUIDModel,
@@ -1392,9 +1399,9 @@ class CounterUpdateDetailResource(ModelResource):
         authorization = CounterAuthorization()
 
 
+@override_settings(ROOT_URLCONF='core.tests.resource_urls')
 class ModelResourceTestCase(TestCase):
     fixtures = ['note_testdata.json']
-    urls = 'core.tests.resource_urls'
 
     def setUp(self):
         super(ModelResourceTestCase, self).setUp()
@@ -1597,6 +1604,51 @@ class ModelResourceTestCase(TestCase):
         self.assertEqual(annr.fields['updated'].readonly, False)
         self.assertEqual(annr.fields['updated'].unique, False)
 
+    def test_fields__empty_list(self):
+        class EmptyFieldsNoteResource(ModelResource):
+            class Meta:
+                resource_name = 'emptyfieldsnotes'
+                object_class = Note
+                fields = []
+
+        resource = EmptyFieldsNoteResource(api_name='v1')
+
+        self.assertEqual(set(resource.fields.keys()), {'resource_uri'})
+
+    def test_fields__empty_list_on_subclass(self):
+        class FieldsNotSpecifiedNoteResource(ModelResource):
+            class Meta:
+                resource_name = 'nofieldsnotes'
+                object_class = Note
+
+        class EmptyFieldsNoteResource(FieldsNotSpecifiedNoteResource):
+            class Meta:
+                resource_name = 'emptyfieldsnotes'
+                fields = []
+
+        resource = EmptyFieldsNoteResource(api_name='v1')
+
+        self.assertEqual(set(resource.fields.keys()), {'resource_uri'})
+
+    def test_fields__list_omitted(self):
+        class FieldsNotSpecifiedNoteResource(ModelResource):
+            class Meta:
+                resource_name = 'nofieldsnotes'
+                object_class = Note
+
+        resource = FieldsNotSpecifiedNoteResource(api_name='v1')
+
+        self.assertEqual(set(resource.fields.keys()), {
+            'updated',
+            'title',
+            'created',
+            'is_active',
+            'id',
+            'content',
+            'slug',
+            'resource_uri',
+        })
+
     def test_urls(self):
         # The common case, where the ``Api`` specifies the name.
         resource = NoteResource(api_name='v1')
@@ -1637,15 +1689,35 @@ class ModelResourceTestCase(TestCase):
         note_1 = resource.get_via_uri('/notes/api/v1/notes/1/')
         self.assertEqual(note_1.pk, 1)
 
+    def test__get_via_uri__identifier_contains_resource_name(self):
+        class CustomNoteResource(NoteResource):
+            class Meta(NoteResource.Meta):
+                detail_uri_name = 'slug'
+        resource = CustomNoteResource(api_name='v1')
+        note_1 = Note.objects.first()
+        note_1.slug = 'notes1-notes'
+        note_1.save()
+        note_1_new = resource.get_via_uri('/notes/api/v1/notes/%s/' % note_1.slug)
+        self.assertEqual(note_1_new.pk, note_1.pk)
+
+    def test__get_via_uri__identifier_same_as_resource_name(self):
+        class CustomNoteResource(NoteResource):
+            class Meta(NoteResource.Meta):
+                detail_uri_name = 'slug'
+        resource = CustomNoteResource(api_name='v1')
+        note_1 = Note.objects.first()
+        note_1.slug = 'notes'
+        note_1.save()
+        note_1_new = resource.get_via_uri('/notes/api/v1/notes/%s/' % note_1.slug)
+        self.assertEqual(note_1_new.pk, note_1.pk)
+
     def test__get_via_uri__uri_has_special_chars(self):
         resource = NoteResource(api_name='v1')
-        # Should work even if app name is the same as resource
         note_1 = resource.get_via_uri('/~krichy/api/v1/notes/1/')
         self.assertEqual(note_1.pk, 1)
 
     def test__get_via_uri__uri_has_encoded_special_chars(self):
         resource = NoteResource(api_name='v1')
-        # Should work even if app name is the same as resource
         note_1 = resource.get_via_uri('/%7ekrichy/api/v1/notes/1/')
         self.assertEqual(note_1.pk, 1)
 
@@ -1659,6 +1731,11 @@ class ModelResourceTestCase(TestCase):
         with self.assertRaises(NotFound):
             resource.get_via_uri('/notes/api/v1/photos/1/')
 
+    def test__get_via_uri__bad_resource_name_contains_resource_name(self):
+        resource = NoteResource(api_name='v1')
+        with self.assertRaises(NotFound):
+            resource.get_via_uri('/notes/api/v1/foonotes/1/')
+
     def test__get_via_uri__nonexistant_resource(self):
         resource = NoteResource(api_name='v1')
         with self.assertRaises(NotFound):
@@ -1671,7 +1748,7 @@ class ModelResourceTestCase(TestCase):
 
     def test__get_via_uri__list_uri(self):
         resource = NoteResource(api_name='v1')
-        with self.assertRaises(MultipleObjectsReturned):
+        with self.assertRaises(NotFound):
             resource.get_via_uri('/api/v1/notes/')
 
     def test__get_via_uri__with_request(self):
@@ -1741,6 +1818,7 @@ class ModelResourceTestCase(TestCase):
         self.assertEqual(resource.determine_format(request), 'application/xml')
 
     def test_build_schema(self):
+        self.maxDiff = None
         related = RelatedNoteResource(api_name='v1')
         schema = adjust_schema(related.build_schema())
         expected_schema = {
@@ -4491,10 +4569,18 @@ class ModelResourceTestCase(TestCase):
             'title': "Foo",
         })
 
-        with self.assertRaises(ValueError):
-            # This is where things blow up, because you can't assign
-            # ``None`` to a required FK.
+        if django.VERSION >= (1, 10):
             hydrated1 = nmbr.full_hydrate(bundle_1)
+            self.assertEqual(hydrated1.obj.title, "Foo")
+            try:
+                self.assertEqual(hydrated1.obj.note, None)
+            except ObjectDoesNotExist:
+                pass
+        else:
+            with self.assertRaises(ValueError):
+                # This is where things blow up, because you can't assign
+                # ``None`` to a required FK.
+                hydrated1 = nmbr.full_hydrate(bundle_1)
 
         # So we introduced ``blank=True``.
         bmbr = BlankMediaBitResource()
@@ -4979,8 +5065,42 @@ class ObjectlessResourceTestCase(TestCase):
         self.assertTrue(bundle is not None)
 
 
-class Handle500TestCase(TestCase):
+class GetResponseClassForExceptionTestCase(TestCase):
+    def setUp(self):
+        self.resource = Resource()
+        self.resource.error_response = Mock()
+        self.request = Mock()
 
+    def test_unsupportedformat(self):
+        response_class = self.resource.get_response_class_for_exception(
+            self.request,
+            UnsupportedFormat('A message')
+        )
+        self.assertEqual(response_class, http.HttpBadRequest)
+
+    def test_unsupportedserializationformat(self):
+        response_class = self.resource.get_response_class_for_exception(
+            self.request,
+            UnsupportedSerializationFormat('text/foo')
+        )
+        self.assertEqual(response_class, http.HttpNotAcceptable)
+
+    def test_unsupporteddeserializationformat(self):
+        response_class = self.resource.get_response_class_for_exception(
+            self.request,
+            UnsupportedDeserializationFormat('text/foo')
+        )
+        self.assertEqual(response_class, http.HttpUnsupportedMediaType)
+
+    def test_unknownerror(self):
+        response_class = self.resource.get_response_class_for_exception(
+            self.request,
+            Exception('A message')
+        )
+        self.assertEqual(response_class, http.HttpApplicationError)
+
+
+class Handle500TestCase(TestCase):
     def setUp(self):
         self.resource = Resource()
         self.resource.error_response = Mock()
@@ -5002,6 +5122,44 @@ class Handle500TestCase(TestCase):
         self.assertEqual(args[1]['error_message'], msg)
         self.assertEqual(kwargs['response_class'], http.HttpBadRequest)
 
+    @override_settings(DEBUG=True)
+    @patch('tastypie.resources.traceback')
+    def test_unsupportedserializationformat_debug(self, traceback):
+        traceback.format_exception = Mock(return_value=[])
+
+        format = 'text/foo'
+        exc = UnsupportedSerializationFormat(format)
+
+        self.resource._handle_500(self.request, exc)
+
+        self.assertEqual(self.resource.error_response.call_count, 1)
+
+        args, kwargs = self.resource.error_response.call_args
+        self.assertEqual(
+            args[1]['error_message'],
+            UnsupportedSerializationFormat._msg_template % format
+        )
+        self.assertEqual(kwargs['response_class'], http.HttpNotAcceptable)
+
+    @override_settings(DEBUG=True)
+    @patch('tastypie.resources.traceback')
+    def test_unsupporteddeserializationformat_debug(self, traceback):
+        traceback.format_exception = Mock(return_value=[])
+
+        format = 'text/foo'
+        exc = UnsupportedDeserializationFormat(format)
+
+        self.resource._handle_500(self.request, exc)
+
+        self.assertEqual(self.resource.error_response.call_count, 1)
+
+        args, kwargs = self.resource.error_response.call_args
+        self.assertEqual(
+            args[1]['error_message'],
+            UnsupportedDeserializationFormat._msg_template % format
+        )
+        self.assertEqual(kwargs['response_class'], http.HttpUnsupportedMediaType)
+
     @override_settings(DEBUG=False)
     @patch('tastypie.resources.traceback')
     def test_unsupported_format_no_debug(self, traceback):
@@ -5016,3 +5174,55 @@ class Handle500TestCase(TestCase):
 
         args, kwargs = self.resource.error_response.call_args
         self.assertEqual(kwargs['response_class'], http.HttpBadRequest)
+
+    @patch('tastypie.resources.sys')
+    def test_unicode_exception(self, mock_sys):
+        exc = None
+        try:
+            raise Exception(u"á! á! I'll get all the á's out of my body!")
+        except Exception as e:
+            exc = e
+            mock_sys.exc_info.return_value = sys.exc_info()
+
+        self.resource._handle_500(self.request, exc)
+
+        self.assertEqual(self.resource.error_response.call_count, 1)
+
+        args, kwargs = self.resource.error_response.call_args
+        self.assertEqual(kwargs['response_class'], http.HttpApplicationError)
+
+
+class ModelDeclarativeMetaclassTestCase(TestCase):
+    """
+    Regression tests for #1475
+    """
+
+    def test__fields_and_queryset_specified__object_class_set(self):
+        class MyResource(ModelResource):
+            class Meta:
+                queryset = Note.objects.all()
+                fields = ['title']
+
+        resource = MyResource()
+        resource._meta.object_class = Note
+
+    def test__queryset_but_no_fields_specified__object_class_set(self):
+        class MyResource(ModelResource):
+            class Meta:
+                queryset = Note.objects.all()
+
+        resource = MyResource()
+        resource._meta.object_class = Note
+
+    def test__1475_example_resource(self):
+        class MyResource(ModelResource):
+            class Meta:
+                queryset = Note.objects.all()
+                fields = ['title']
+                allowed_methods = ['get']
+                resource_name = 'my_resource'
+                authentication = BasicAuthentication()
+                include_resource_uri = False
+
+        resource = MyResource()
+        resource._meta.object_class = Note
